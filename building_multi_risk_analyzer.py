@@ -136,6 +136,357 @@ class BuildingMultiRiskAnalyzer:
             '52': '전북',  # 전북 특별자치도 (신규 코드)
         }
 
+        # 사업소 매핑 정보 (사업소명 → (광역지자체, 담당지역 리스트))
+        # 담당지역 리스트가 None이면 해당 광역지자체 전체
+        self.branch_mapping = {}
+
+        # 사업소명에서 광역지자체 추출을 위한 매핑
+        self.branch_region_keywords = {
+            '서울': '서울',
+            '부산': '부산', '울산': '울산',
+            '대구': '대구', '경북': '경북', '구미': '경북', '칠곡': '경북', '경주': '경북',
+            '인천': '인천', '부천': '경기', '김포': '경기',
+            '광주': '광주', '전남': '전남', '여수': '전남',
+            '대전': '대전', '세종': '세종', '충남': '충남', '천안': '충남', '아산': '충남',
+            '서산': '충남', '태안': '충남',
+            '경기': '경기', '수원': '경기', '화성': '경기', '안산': '경기', '시흥': '경기',
+            '평택': '경기', '안성': '경기', '이천': '경기', '여주': '경기', '용인': '경기',
+            '고양': '경기', '파주': '경기',
+            '강원': '강원', '원주': '강원', '횡성': '강원',
+            '충북': '충북', '충주': '충북', '제천': '제천', '단양': '충북', '영동': '충북', '옥천': '충북',
+            '전북': '전북', '익산': '전북', '군산': '전북', '남원': '전북', '순창': '전북',
+            '경남': '경남', '김해': '경남', '양산': '경남', '밀양': '경남', '창녕': '경남',
+            '제주': '제주',
+        }
+
+        # 외부 사업소 매핑 파일 로드
+        self._load_branch_mapping_file()
+
+    def _load_branch_mapping_file(self):
+        """외부 사업소 매핑 파일 로드 (전국 사업소 일람표.txt)
+
+        파일 형식 (각 줄):
+            사업소명 지역1, 지역2, 지역3
+
+        예시:
+            서울본부직할 마포구, 은평구, 서대문구, 용산구, 종로구, 중구
+            충북본부직할 청주시, 보은군, 괴산군, 진천군, 증평군
+
+        Note:
+            담당지역만 저장하고, 광역지자체는 get_branch_info에서 동적으로 추출
+        """
+        mapping_file = self.base_path / "전국 사업소 일람표.txt"
+
+        if not mapping_file.exists():
+            # 대체 파일명 시도
+            mapping_file = self.base_path / "branch_mapping.txt"
+            if not mapping_file.exists():
+                return
+
+        try:
+            with open(mapping_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):  # 빈 줄이나 주석 무시
+                        continue
+
+                    # 첫 번째 공백으로 사업소명과 담당지역 분리
+                    first_space = line.find(' ')
+                    if first_space == -1:
+                        continue
+
+                    branch_name = line[:first_space].strip()
+                    districts_str = line[first_space:].strip()
+
+                    # 담당지역 파싱 (쉼표 구분)
+                    districts = [d.strip() for d in districts_str.split(',') if d.strip()]
+
+                    if not districts:
+                        continue
+
+                    # 담당지역만 저장 (광역지자체는 나중에 동적 추출)
+                    self.branch_mapping[branch_name] = districts
+
+            print(f"사업소 매핑 파일 로드 완료: {len(self.branch_mapping)}개 사업소")
+        except Exception as e:
+            print(f"사업소 매핑 파일 로드 실패: {e}")
+
+    def _extract_region_from_branch_name(self, branch_name: str) -> str:
+        """사업소명에서 광역지자체 추출
+
+        예: '충북본부직할' → '충북'
+            '서울동부지사' → '서울'
+            '대구경북본부직할' → '대구' (첫 번째 매칭)
+        """
+        # 사업소명에서 키워드 매칭
+        for keyword, region in self.branch_region_keywords.items():
+            if keyword in branch_name:
+                return region
+
+        return None
+
+    def _build_district_to_region_map(self) -> dict:
+        """구/군명 → 광역지자체 역매핑 생성"""
+        district_to_region = {}
+        for region_name, region_info in self.region_mapping.items():
+            for district_name in region_info['districts'].keys():
+                district_to_region[district_name] = region_name
+                # '청주시 상당구' → '청주시'도 매핑 (부분 이름)
+                if ' ' in district_name:
+                    city_name = district_name.split(' ')[0]
+                    if city_name not in district_to_region:
+                        district_to_region[city_name] = region_name
+        return district_to_region
+
+    def find_region_for_district(self, district_name: str) -> str:
+        """구/군명으로 광역지자체 찾기
+
+        Args:
+            district_name: 구/군명 (예: '청주시', '마포구', '전주시 완산구')
+
+        Returns:
+            광역지자체명 또는 None
+        """
+        district_to_region = self._build_district_to_region_map()
+
+        # 1. 정확히 일치
+        if district_name in district_to_region:
+            return district_to_region[district_name]
+
+        # 2. 부분 매칭 (예: '청주시' → '충북')
+        for dist, region in district_to_region.items():
+            if dist.startswith(district_name) or district_name.startswith(dist):
+                return region
+
+        return None
+
+    def get_branch_info(self, branch_name: str) -> dict:
+        """사업소명으로 광역지자체별 구/군 리스트 조회
+
+        Args:
+            branch_name: 사업소명 (예: '서울본부직할', '충북본부직할', '대구경북본부직할')
+
+        Returns:
+            {광역지자체: [실제 폴더에 매칭되는 구/군 리스트], ...} 또는 None
+            예: {'대구': ['중구', '동구', ...], '경북': ['군위군', '경산시', ...]}
+
+        Note:
+            담당지역이 '청주시'처럼 시 단위로만 되어 있으면,
+            실제 폴더에서 '청주시 상당구', '청주시 서원구' 등을 찾아서 확장함
+        """
+        raw_districts = self.branch_mapping.get(branch_name)
+        if not raw_districts:
+            return None
+
+        # 사업소명에서 가능한 광역지자체 힌트 추출
+        region_hints = self._extract_regions_from_branch_name(branch_name)
+
+        # 담당지역을 광역지자체별로 그룹화
+        region_districts = {}
+
+        for district in raw_districts:
+            # 각 담당지역이 어느 광역지자체에 속하는지 찾기 (힌트 활용)
+            region = self._find_region_for_raw_district(district, region_hints)
+
+            if region:
+                if region not in region_districts:
+                    region_districts[region] = []
+                region_districts[region].append(district)
+
+        if not region_districts:
+            return None
+
+        # 각 광역지자체별로 담당지역을 실제 폴더명으로 확장
+        result = {}
+        for region, districts in region_districts.items():
+            expanded = self._expand_districts_to_folders(region, districts)
+            if expanded:
+                result[region] = expanded
+
+        return result if result else None
+
+    def _extract_regions_from_branch_name(self, branch_name: str) -> list:
+        """사업소명에서 가능한 모든 광역지자체 추출
+
+        예: '대구경북본부직할' → ['대구', '경북']
+            '서울본부직할' → ['서울']
+            '부산울산본부직할' → ['부산', '울산']
+        """
+        regions = []
+        for keyword, region in self.branch_region_keywords.items():
+            if keyword in branch_name and region in self.region_mapping:
+                if region not in regions:
+                    regions.append(region)
+        return regions
+
+    def _find_region_for_raw_district(self, district_name: str, region_hints: list = None) -> str:
+        """원본 담당지역명으로 광역지자체 찾기
+
+        Args:
+            district_name: 담당지역명 (예: '청주시', '마포구', '울산시')
+            region_hints: 사업소명에서 추출한 광역지자체 힌트 리스트
+
+        Returns:
+            광역지자체명 또는 None
+
+        Note:
+            동명이인 문제 해결을 위해 region_hints를 우선 검색
+            예: '서울본부직할'의 '중구'는 서울의 중구로 매칭
+        """
+        # 0. 특수 케이스: '울산시' → '울산', '광주시' → '광주' 등 (광역시 전체)
+        special_mappings = {
+            '울산시': '울산',
+            '광주시': '광주',
+            '대전시': '대전',
+            '세종시': '세종',
+            '부산시': '부산',
+            '대구시': '대구',
+            '인천시': '인천',
+        }
+        if district_name in special_mappings:
+            mapped_region = special_mappings[district_name]
+            # 힌트가 있으면 힌트 내에 있는 경우만 반환
+            if region_hints and mapped_region in region_hints:
+                return mapped_region
+            # 힌트가 없으면 그냥 반환
+            if not region_hints:
+                return mapped_region
+            # 힌트가 있는데 매핑된 지역이 힌트에 없으면 힌트 중 첫 번째로
+            return region_hints[0] if region_hints else mapped_region
+
+        # 1. 힌트가 있으면 힌트 광역지자체에서 먼저 검색
+        if region_hints:
+            for region_name in region_hints:
+                if region_name not in self.region_mapping:
+                    continue
+                folder_names = list(self.region_mapping[region_name]['districts'].keys())
+
+                # 정확히 일치
+                if district_name in folder_names:
+                    return region_name
+
+                # 부분 매칭 (예: '청주시' → '청주시 상당구')
+                for folder in folder_names:
+                    if folder.startswith(district_name):
+                        return region_name
+
+        # 2. 힌트에서 못 찾으면 전체에서 검색 (단, 시/군 단위만)
+        # '구' 단위 동명이인(중구, 동구 등)은 힌트 없이는 찾지 않음
+        is_gu = district_name.endswith('구') and not district_name.endswith('시구')
+
+        if not is_gu:  # 시/군 단위인 경우만 전체 검색
+            for region_name, region_info in self.region_mapping.items():
+                folder_names = list(region_info['districts'].keys())
+
+                # 정확히 일치
+                if district_name in folder_names:
+                    return region_name
+
+                # 부분 매칭 (예: '청주시' → '청주시 상당구')
+                for folder in folder_names:
+                    if folder.startswith(district_name):
+                        return region_name
+
+        # 3. 그래도 못 찾으면 키워드 매핑으로 추론 (시/군 이름에서)
+        for keyword, region in self.branch_region_keywords.items():
+            if keyword in district_name:
+                if region in self.region_mapping:
+                    return region
+
+        return None
+
+    def _expand_districts_to_folders(self, region_name: str, raw_districts: list) -> list:
+        """담당지역 리스트를 실제 폴더명으로 확장
+
+        예: ['청주시', '보은군'] → ['청주시 상당구', '청주시 서원구', ..., '보은군']
+            ['울산시'] → 울산 전체 폴더
+            ['광주시'] → 광주 전체 폴더
+
+        Args:
+            region_name: 광역지자체명
+            raw_districts: 원본 담당지역 리스트 (사업소 일람표 기준)
+
+        Returns:
+            실제 폴더명으로 확장된 구/군 리스트
+        """
+        if region_name not in self.region_mapping:
+            return raw_districts
+
+        valid_folders = list(self.region_mapping[region_name]['districts'].keys())
+        expanded = []
+
+        # 광역시 전체를 의미하는 특수 키워드
+        metro_city_keywords = {
+            '울산시': '울산',
+            '광주시': '광주',
+            '대전시': '대전',
+            '세종시': '세종',
+            '부산시': '부산',
+            '대구시': '대구',
+            '인천시': '인천',
+        }
+
+        for district in raw_districts:
+            # 0. 광역시 전체인 경우 (예: '울산시' → 울산 전체)
+            if district in metro_city_keywords:
+                target_region = metro_city_keywords[district]
+                if target_region == region_name:
+                    # 해당 광역시의 모든 폴더 추가
+                    expanded.extend(valid_folders)
+                    continue
+
+            # 1. 정확히 일치하는 폴더가 있는지 확인
+            if district in valid_folders:
+                expanded.append(district)
+                continue
+
+            # 2. '시' 단위 입력 → 해당 시의 모든 구 찾기 (예: '청주시' → '청주시 상당구', ...)
+            matching_folders = [f for f in valid_folders if f.startswith(district)]
+            if matching_folders:
+                expanded.extend(matching_folders)
+                continue
+
+            # 3. '시' 없이 입력된 경우 (예: '전주' → '전주시 완산구', '전주시 덕진구')
+            if not district.endswith('시') and not district.endswith('군') and not district.endswith('구'):
+                # '시'를 붙여서 다시 검색
+                district_with_si = district + '시'
+                matching_folders = [f for f in valid_folders if f.startswith(district_with_si)]
+                if matching_folders:
+                    expanded.extend(matching_folders)
+                    continue
+
+            # 4. 부분 매칭 시도 (예: '성남' → '성남시', '성남시 수정구' 등)
+            partial_matches = [f for f in valid_folders if district in f]
+            if partial_matches:
+                expanded.extend(partial_matches)
+
+        # 중복 제거 (순서 유지)
+        seen = set()
+        unique_expanded = []
+        for d in expanded:
+            if d not in seen:
+                seen.add(d)
+                unique_expanded.append(d)
+
+        return unique_expanded if unique_expanded else None
+
+    def find_districts_by_city(self, region_name: str, city_name: str) -> list:
+        """특정 시(city)에 속하는 모든 구/군 찾기
+
+        Args:
+            region_name: 광역지자체명 (예: '충북')
+            city_name: 시명 (예: '청주시')
+
+        Returns:
+            해당 시의 구/군 리스트 (예: ['청주시 상당구', '청주시 서원구', ...])
+        """
+        if region_name not in self.region_mapping:
+            return []
+
+        districts = self.region_mapping[region_name]['districts'].keys()
+        matching = [d for d in districts if d.startswith(city_name)]
+        return matching
+
     def _build_region_mapping(self) -> dict:
         """지역 폴더 구조를 스캔하여 매핑 정보 생성"""
         mapping = {}
@@ -1121,7 +1472,12 @@ def validate_region_input(analyzer, region_name: str) -> str:
 
 
 def validate_district_input(analyzer, region_name: str, district_input: str) -> list:
-    """구/군명 유효성 검사 및 오타 수정 (복수 입력 지원)"""
+    """구/군명 유효성 검사 및 오타 수정 (복수 입력 지원, 부분 매칭 지원)
+
+    개선된 기능:
+    - '청주시'처럼 부분 입력 시 해당 시의 모든 구를 찾아서 분석할지 물어봄
+    - 정확한 이름 매칭 우선, 부분 매칭은 확인 후 진행
+    """
     valid_districts = list(analyzer.region_mapping[region_name]['districts'].keys())
 
     # 쉼표로 분리하여 복수 입력 처리
@@ -1131,6 +1487,50 @@ def validate_district_input(analyzer, region_name: str, district_input: str) -> 
     for district in input_districts:
         current_district = district
 
+        # 1. 정확히 일치하는지 먼저 확인
+        if current_district in valid_districts:
+            validated.append(current_district)
+            continue
+
+        # 2. 부분 매칭 확인 (예: '청주시' → '청주시 상당구', '청주시 서원구' 등)
+        partial_matches = [d for d in valid_districts if d.startswith(current_district)]
+
+        if partial_matches:
+            print(f"\n📍 '{current_district}'으로 시작하는 구/군이 {len(partial_matches)}개 있습니다:")
+            for i, name in enumerate(partial_matches, 1):
+                print(f"     {i}. {name}")
+
+            while True:
+                choice = input(f"\n'{current_district}' 전체({len(partial_matches)}개 구/군)를 분석하시겠습니까? (y/n): ").strip().lower()
+                if choice == 'y':
+                    validated.extend(partial_matches)
+                    print(f"   ✓ '{current_district}' 전체 {len(partial_matches)}개 구/군 추가됨")
+                    break
+                elif choice == 'n':
+                    # 개별 선택
+                    print(f"\n   분석할 구/군을 직접 선택하세요 (쉼표로 구분, 건너뛰려면 Enter):")
+                    sub_choice = input("   선택: ").strip()
+                    if sub_choice:
+                        sub_districts = [d.strip() for d in sub_choice.split(',') if d.strip()]
+                        for sd in sub_districts:
+                            if sd in valid_districts:
+                                validated.append(sd)
+                            elif sd in partial_matches:
+                                validated.append(sd)
+                            else:
+                                # 번호로 선택했는지 확인
+                                try:
+                                    idx = int(sd) - 1
+                                    if 0 <= idx < len(partial_matches):
+                                        validated.append(partial_matches[idx])
+                                except ValueError:
+                                    print(f"     ⚠️ '{sd}' 인식 불가, 건너뜀")
+                    break
+                else:
+                    print("   ⚠️ 'y' 또는 'n'만 입력해주세요.")
+            continue
+
+        # 3. 부분 매칭도 없으면 기존 로직 (유사 이름 제안)
         while current_district not in valid_districts:
             print(f"\n⚠️  '{current_district}'은(는) '{region_name}'에 존재하지 않는 구/군명입니다.")
 
@@ -1157,11 +1557,14 @@ def validate_district_input(analyzer, region_name: str, district_input: str) -> 
         if current_district:
             validated.append(current_district)
 
+    # 중복 제거
+    validated = list(dict.fromkeys(validated))
+
     return validated
 
 
 def interactive_mode():
-    """대화형 모드로 실행 (복수 지역, 오타 감지, 광역 일괄 분석 지원)"""
+    """대화형 모드로 실행 (복수 지역, 오타 감지, 광역 일괄 분석, 사업소 지원)"""
     print("=" * 70)
     print("    건물 노후위험도 × 홍수위험 × 산사태근접위험 통합 분석")
     print("=" * 70)
@@ -1180,78 +1583,121 @@ def interactive_mode():
     # 지역 목록 표시
     analyzer.list_available_regions()
 
+    # 사업소 목록 표시
+    if analyzer.branch_mapping:
+        print("\n" + "=" * 50)
+        print("등록된 사업소 목록")
+        print("=" * 50)
+        for branch_name, districts in analyzer.branch_mapping.items():
+            if isinstance(districts, list):
+                districts_str = ', '.join(districts[:5])
+                if len(districts) > 5:
+                    districts_str += f" 외 {len(districts)-5}개"
+                print(f"  - {branch_name}: {districts_str}")
+            else:
+                print(f"  - {branch_name}: {districts}")
+
     # =========================================================================
-    # 1. 광역지자체 선택 (복수 입력 지원)
+    # 1. 광역지자체 또는 사업소 선택
     # =========================================================================
     print("\n" + "=" * 70)
-    print("[1단계] 광역지자체 선택")
+    print("[1단계] 광역지자체 또는 사업소 선택")
     print("-" * 70)
-    print("  - 복수 선택 가능: 쉼표(,)로 구분 (예: 서울, 부산)")
+    print("  - 광역지자체: 쉼표(,)로 복수 선택 가능 (예: 서울, 부산)")
+    print("  - 사업소명: 직접 입력 (예: 서울본부직할, 충북본부)")
     print("  - 단일 선택 후 구/군 지정 가능")
 
-    region_input = input("\n분석할 광역지자체를 입력하세요: ").strip()
+    region_input = input("\n분석할 광역지자체 또는 사업소를 입력하세요: ").strip()
 
     if not region_input:
-        print("지역이 입력되지 않았습니다.")
+        print("입력이 없습니다.")
         return
 
-    # 복수 광역지자체 처리
-    region_names = [r.strip() for r in region_input.split(',') if r.strip()]
-    validated_regions = []
+    # 사업소명 확인
+    branch_info = analyzer.get_branch_info(region_input)
 
-    for region in region_names:
-        validated = validate_region_input(analyzer, region)
-        if validated:
-            validated_regions.append(validated)
+    if branch_info:
+        # 사업소명으로 입력된 경우
+        # branch_info = {광역지자체: [구/군 리스트], ...}
+        print(f"\n✓ 사업소 인식: {region_input}")
 
-    if not validated_regions:
-        print("유효한 지역이 없습니다.")
-        return
+        districts_by_region = {}
+        validated_regions = []
 
-    print(f"\n✓ 선택된 광역지자체: {', '.join(validated_regions)}")
+        for region_name, branch_districts in branch_info.items():
+            validated_regions.append(region_name)
+            print(f"  - {region_name}: {', '.join(branch_districts) if branch_districts else '전체'}")
 
-    # =========================================================================
-    # 2. 구/군 선택 (복수 입력 지원)
-    # =========================================================================
-    print("\n" + "=" * 70)
-    print("[2단계] 구/군 선택")
-    print("-" * 70)
-    print("  - 전체 분석: Enter 입력")
-    print("  - 복수 선택: 쉼표(,)로 구분 (예: 전주시 완산구, 전주시 덕진구)")
-
-    districts_by_region = {}
-
-    for region in validated_regions:
-        print(f"\n[{region}] 구/군 목록:")
-        district_list = list(analyzer.region_mapping[region]['districts'].keys())
-        for i, d in enumerate(district_list, 1):
-            print(f"  {i}. {d}")
-
-        if len(validated_regions) == 1:
-            district_input = input(f"\n'{region}'에서 분석할 구/군 (전체는 Enter): ").strip()
-        else:
-            district_input = input(f"\n'{region}'에서 분석할 구/군 (전체는 Enter, 건너뛰기는 'skip'): ").strip()
-
-        if district_input.lower() == 'skip':
-            print(f"  '{region}' 건너뜀")
-            continue
-        elif not district_input:
-            # 전체 분석
-            districts_by_region[region] = None
-            print(f"  ✓ '{region}' 전체 분석")
-        else:
-            # 개별 구/군 선택
-            validated_districts = validate_district_input(analyzer, region, district_input)
-            if validated_districts:
-                districts_by_region[region] = validated_districts
-                print(f"  ✓ 선택된 구/군: {', '.join(validated_districts)}")
+            if branch_districts:
+                districts_by_region[region_name] = branch_districts
             else:
-                print(f"  '{region}'에서 유효한 구/군이 없어 전체 분석으로 진행합니다.")
-                districts_by_region[region] = None
+                districts_by_region[region_name] = None
 
-    if not districts_by_region:
-        print("분석할 지역이 없습니다.")
-        return
+    else:
+        # 광역지자체명으로 입력된 경우 (기존 로직)
+        region_names = [r.strip() for r in region_input.split(',') if r.strip()]
+        validated_regions = []
+
+        for region in region_names:
+            validated = validate_region_input(analyzer, region)
+            if validated:
+                validated_regions.append(validated)
+
+        if not validated_regions:
+            print("유효한 지역이 없습니다.")
+            return
+
+        print(f"\n✓ 선택된 광역지자체: {', '.join(validated_regions)}")
+        districts_by_region = None  # 다음 단계에서 설정
+
+    # =========================================================================
+    # 2. 구/군 선택 (복수 입력 지원) - 사업소 입력 시 건너뜀
+    # =========================================================================
+    if districts_by_region is None:
+        # 사업소명이 아닌 광역지자체명으로 입력한 경우에만 구/군 선택
+        print("\n" + "=" * 70)
+        print("[2단계] 구/군 선택")
+        print("-" * 70)
+        print("  - 전체 분석: Enter 입력")
+        print("  - 복수 선택: 쉼표(,)로 구분 (예: 전주시 완산구, 전주시 덕진구)")
+        print("  - 시 전체 분석: 시명만 입력 (예: 청주시 → 청주시 전체 구 분석)")
+
+        districts_by_region = {}
+
+        for region in validated_regions:
+            print(f"\n[{region}] 구/군 목록:")
+            district_list = list(analyzer.region_mapping[region]['districts'].keys())
+            for i, d in enumerate(district_list, 1):
+                print(f"  {i}. {d}")
+
+            if len(validated_regions) == 1:
+                district_input = input(f"\n'{region}'에서 분석할 구/군 (전체는 Enter): ").strip()
+            else:
+                district_input = input(f"\n'{region}'에서 분석할 구/군 (전체는 Enter, 건너뛰기는 'skip'): ").strip()
+
+            if district_input.lower() == 'skip':
+                print(f"  '{region}' 건너뜀")
+                continue
+            elif not district_input:
+                # 전체 분석
+                districts_by_region[region] = None
+                print(f"  ✓ '{region}' 전체 분석")
+            else:
+                # 개별 구/군 선택
+                validated_districts = validate_district_input(analyzer, region, district_input)
+                if validated_districts:
+                    districts_by_region[region] = validated_districts
+                    print(f"  ✓ 선택된 구/군: {', '.join(validated_districts)}")
+                else:
+                    print(f"  '{region}'에서 유효한 구/군이 없어 전체 분석으로 진행합니다.")
+                    districts_by_region[region] = None
+
+        if not districts_by_region:
+            print("분석할 지역이 없습니다.")
+            return
+    else:
+        # 사업소명으로 입력한 경우 - 구/군 선택 건너뜀
+        print("\n  (사업소 지정으로 구/군 선택 단계 건너뜀)")
 
     # =========================================================================
     # 3. 연령 필터 설정
