@@ -265,6 +265,8 @@ class BuildingMultiRiskAnalyzer:
 
         Args:
             branch_name: 사업소명 (예: '서울본부직할', '충북본부직할', '대구경북본부직할')
+                        또는 본부명 (예: '서울본부', '경기본부', '경기북부본부')
+                        → 본부명만 입력하면 해당 본부의 직할+모든지사 전체 조회
 
         Returns:
             {광역지자체: [실제 폴더에 매칭되는 구/군 리스트], ...} 또는 None
@@ -274,7 +276,8 @@ class BuildingMultiRiskAnalyzer:
             담당지역이 '청주시'처럼 시 단위로만 되어 있으면,
             실제 폴더에서 '청주시 상당구', '청주시 서원구' 등을 찾아서 확장함
         """
-        raw_districts = self.branch_mapping.get(branch_name)
+        # 본부명으로 입력한 경우 (예: '서울본부' → 서울 관련 모든 사업소 합침)
+        raw_districts = self._get_districts_for_branch(branch_name)
         if not raw_districts:
             return None
 
@@ -304,6 +307,91 @@ class BuildingMultiRiskAnalyzer:
                 result[region] = expanded
 
         return result if result else None
+
+    def _get_districts_for_branch(self, branch_name: str) -> list:
+        """사업소명 또는 본부명으로 담당지역 리스트 조회
+
+        Args:
+            branch_name: 사업소명 또는 본부명
+                - 정확한 사업소명: '서울본부직할', '서울동부지사' 등
+                - 본부명: '서울본부', '경기본부', '경기북부본부' 등
+
+        Returns:
+            담당지역 리스트 (모든 관련 사업소 합침)
+
+        Examples:
+            '서울본부직할' → ['마포구', '은평구', ...] (직할만)
+            '서울본부' → ['마포구', ..., '동대문구', ..., '영등포구', ...] (직할+모든지사)
+            '경기북부본부' → 경기북부본부직할 + 고양파주지사 + 경기북동부지사 전체
+        """
+        # 1. 정확히 일치하는 사업소가 있으면 그것만 반환
+        if branch_name in self.branch_mapping:
+            return self.branch_mapping[branch_name]
+
+        # 2. 본부명으로 입력한 경우 (직할/지사 없이)
+        #    해당 본부의 직할 + 관련 지사 모두 합침
+        if '본부' in branch_name and '직할' not in branch_name and '지사' not in branch_name:
+            return self._get_all_districts_for_headquarter(branch_name)
+
+        # 3. 광역지자체명은 사업소로 인식하지 않음
+        #    (예: '전북', '서울' 등은 광역지자체로 처리되어야 함)
+        region_names = {'서울', '부산', '대구', '인천', '광주', '대전', '울산', '세종',
+                       '경기', '강원', '충북', '충남', '전북', '전남', '경북', '경남', '제주'}
+        if branch_name in region_names:
+            return None
+
+        # 4. 부분 매칭 시도 (오타 등) - 광역지자체명이 아닌 경우만
+        for registered_name in self.branch_mapping.keys():
+            if branch_name in registered_name or registered_name in branch_name:
+                return self.branch_mapping[registered_name]
+
+        return None
+
+    def _get_all_districts_for_headquarter(self, hq_name: str) -> list:
+        """본부명으로 해당 본부의 모든 사업소(직할+지사) 담당지역 합침
+
+        Args:
+            hq_name: 본부명 (예: '서울본부', '경기본부', '경기북부본부')
+
+        Returns:
+            해당 본부의 모든 담당지역 리스트
+
+        Logic:
+            1. 본부명에서 핵심 키워드 추출 (예: '서울본부' → '서울')
+            2. 해당 키워드로 시작하는 모든 사업소 찾기
+            3. 모든 담당지역 합침 (중복 제거)
+        """
+        all_districts = []
+        matched_branches = []
+
+        # 본부명에서 핵심 키워드 추출
+        # '서울본부' → '서울', '경기북부본부' → '경기북부', '대구경북본부' → '대구경북'
+        hq_keyword = hq_name.replace('본부', '')
+
+        # 해당 키워드로 시작하는 모든 사업소 찾기
+        for registered_name, districts in self.branch_mapping.items():
+            # 직할 체크: '서울본부직할'은 '서울'로 시작
+            # 지사 체크: '서울동부지사'도 '서울'로 시작
+            if registered_name.startswith(hq_keyword):
+                matched_branches.append(registered_name)
+                all_districts.extend(districts)
+
+        if matched_branches:
+            # 중복 제거 (순서 유지)
+            seen = set()
+            unique_districts = []
+            for d in all_districts:
+                if d not in seen:
+                    seen.add(d)
+                    unique_districts.append(d)
+
+            print(f"\n  [본부 전체 조회] {hq_name}")
+            print(f"    포함 사업소: {', '.join(matched_branches)}")
+            print(f"    담당지역 수: {len(unique_districts)}개")
+
+            return unique_districts
+
+        return None
 
     def _extract_regions_from_branch_name(self, branch_name: str) -> list:
         """사업소명에서 가능한 모든 광역지자체 추출
@@ -715,9 +803,9 @@ class BuildingMultiRiskAnalyzer:
     def _landslide_distance_transform(self, building_gdf: gpd.GeoDataFrame,
                                        tif_path: Path) -> gpd.GeoDataFrame:
         """
-        거리 래스터 변환 방식 (Distance Transform)
+        거리 래스터 변환 방식 (Distance Transform) - 벡터화 최적화 버전
         - scipy의 distance_transform_edt로 거리 래스터 생성
-        - 건물 좌표에서 거리값 샘플링 (O(1) 조회)
+        - numpy 벡터화 연산으로 모든 건물 좌표 일괄 처리 (iterrows 제거)
         """
         building_gdf = building_gdf.copy()
 
@@ -752,7 +840,6 @@ class BuildingMultiRiskAnalyzer:
                 return building_gdf
 
             # Distance Transform: 비위험지역 픽셀에서 가장 가까운 위험지역까지 거리
-            # ~risk_mask: 위험지역이 아닌 곳 = True
             print("      거리 변환 계산 중...")
             distance_pixels = distance_transform_edt(~risk_mask)
             distance_meters = distance_pixels * pixel_size
@@ -760,7 +847,7 @@ class BuildingMultiRiskAnalyzer:
             print(f"      거리 변환 완료 (최대 거리: {distance_meters.max():.0f}m)")
 
             # 건물 좌표를 래스터 좌표로 변환하여 거리값 샘플링
-            print(f"      건물 {len(building_gdf)}개 거리 샘플링 중...")
+            print(f"      건물 {len(building_gdf)}개 거리 샘플링 중 (벡터화)...")
 
             # CRS 통일
             if building_gdf.crs != crs:
@@ -768,21 +855,23 @@ class BuildingMultiRiskAnalyzer:
             else:
                 building_gdf_proj = building_gdf
 
-            distances = []
-            for idx, row in building_gdf_proj.iterrows():
-                centroid = row.geometry.centroid
+            # 벡터화: 모든 건물의 centroid 좌표를 한 번에 추출
+            centroids = building_gdf_proj.geometry.centroid
+            coords_x = centroids.x.values
+            coords_y = centroids.y.values
 
-                # 좌표 → 래스터 인덱스 변환
-                col = int((centroid.x - transform[2]) / transform[0])
-                row_idx = int((centroid.y - transform[5]) / transform[4])
+            # 좌표 → 래스터 인덱스 변환 (벡터화)
+            cols = ((coords_x - transform[2]) / transform[0]).astype(int)
+            rows = ((coords_y - transform[5]) / transform[4]).astype(int)
 
-                # 래스터 범위 내인지 확인
-                if 0 <= row_idx < data.shape[0] and 0 <= col < data.shape[1]:
-                    dist = distance_meters[row_idx, col]
-                else:
-                    dist = 99999  # 래스터 범위 밖
+            # 래스터 범위 체크 (벡터화)
+            valid_mask = (rows >= 0) & (rows < data.shape[0]) & (cols >= 0) & (cols < data.shape[1])
 
-                distances.append(dist)
+            # 거리값 추출 (벡터화)
+            distances = np.full(len(building_gdf), 99999.0)
+            valid_rows = rows[valid_mask]
+            valid_cols = cols[valid_mask]
+            distances[valid_mask] = distance_meters[valid_rows, valid_cols]
 
             building_gdf['산사태거리'] = distances
 
@@ -1198,7 +1287,7 @@ class BuildingMultiRiskAnalyzer:
             overlap_ratios.append(max_overlap)
 
         building_gdf['겹침비율'] = overlap_ratios
-        
+
         # 홍수위험 등급 분류
         flood_risk = building_gdf['겹침비율'].apply(self.classify_flood_risk)
         building_gdf['홍수등급'] = flood_risk.apply(lambda x: x[0])
@@ -1209,6 +1298,129 @@ class BuildingMultiRiskAnalyzer:
         print(f"    홍수위험지역 교차 건물: {len(flood_buildings)}개")
 
         return building_gdf
+
+    def _apply_fire_history_weight(self, gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+        """
+        전기화재이력과 겹치는 건물에 종합점수 가중치 적용
+
+        - 10m 범위 내 겹침 (직접 겹침): 1.5배 가중치
+        - 50m 범위 내 겹침 (근접): 1.2배 가중치
+        - 안겹침: 가중치 없음
+
+        Args:
+            gdf: 분석 결과 GeoDataFrame
+
+        Returns:
+            전기화재 가중치가 적용된 GeoDataFrame
+            - 전기화재 컬럼: 0(없음), 1(50m 이내), 2(10m 이내/직접겹침)
+        """
+        # 전기화재이력 SHP 파일 경로
+        fire_shp_path = self.base_path / "전기화재이력" / "전기화재_2022_2024_좌표변환_5186.shp"
+
+        if not fire_shp_path.exists():
+            print(f"\n[전기화재이력] 파일 없음: {fire_shp_path}")
+            print("  → 전기화재 가중치 미적용")
+            gdf['전기화재'] = 0
+            return gdf
+
+        print(f"\n" + "=" * 70)
+        print("전기화재이력 가중치 분석")
+        print("=" * 70)
+        print(f"  전기화재 데이터: {fire_shp_path.name}")
+        print(f"  기준: 10m 이내 → 1.5배, 50m 이내 → 1.2배")
+
+        try:
+            # 전기화재이력 데이터 로드
+            fire_gdf = gpd.read_file(fire_shp_path, encoding='cp949')
+            print(f"  전기화재 이력 수: {len(fire_gdf)}건")
+
+            # 좌표계 통일 (EPSG:5186)
+            if fire_gdf.crs is None:
+                fire_gdf = fire_gdf.set_crs(epsg=5186)
+            elif fire_gdf.crs.to_epsg() != 5186:
+                fire_gdf = fire_gdf.to_crs(epsg=5186)
+
+            gdf_check = gdf.copy()
+            if gdf_check.crs is None:
+                gdf_check = gdf_check.set_crs(epsg=5186)
+            elif gdf_check.crs.to_epsg() != 5186:
+                gdf_check = gdf_check.to_crs(epsg=5186)
+
+            # 50m 버퍼 생성 (기존 10m 폴리곤에서 추가 40m 확장)
+            print("  50m 버퍼 생성 중...")
+            fire_gdf_50m = fire_gdf.copy()
+            fire_gdf_50m['geometry'] = fire_gdf_50m.geometry.buffer(40)  # 10m + 40m = 50m
+
+            # 공간 인덱스 생성
+            fire_tree_10m = STRtree(fire_gdf.geometry.values)  # 원본 (10m)
+            fire_tree_50m = STRtree(fire_gdf_50m.geometry.values)  # 50m 버퍼
+
+            # 겹침 여부 판별
+            # 전기화재: 0(없음), 1(50m 이내), 2(10m 이내/직접겹침)
+            fire_flags = []
+            for idx, row in gdf_check.iterrows():
+                building_geom = row.geometry
+
+                # 1단계: 10m 범위(직접 겹침) 확인
+                is_10m = False
+                candidate_10m = fire_tree_10m.query(building_geom)
+                for cand_idx in candidate_10m:
+                    fire_geom = fire_gdf.iloc[cand_idx].geometry
+                    if building_geom.intersects(fire_geom):
+                        is_10m = True
+                        break
+
+                if is_10m:
+                    fire_flags.append(2)  # 10m 이내 직접 겹침
+                    continue
+
+                # 2단계: 50m 범위 확인
+                is_50m = False
+                candidate_50m = fire_tree_50m.query(building_geom)
+                for cand_idx in candidate_50m:
+                    fire_geom_50m = fire_gdf_50m.iloc[cand_idx].geometry
+                    if building_geom.intersects(fire_geom_50m):
+                        is_50m = True
+                        break
+
+                if is_50m:
+                    fire_flags.append(1)  # 50m 이내
+                else:
+                    fire_flags.append(0)  # 범위 밖
+
+            gdf['전기화재'] = fire_flags
+
+            # 통계 출력
+            count_10m = sum(1 for f in fire_flags if f == 2)
+            count_50m = sum(1 for f in fire_flags if f == 1)
+            print(f"  10m 이내 (직접 겹침): {count_10m}건 → 1.5배 가중치")
+            print(f"  50m 이내 (근접): {count_50m}건 → 1.2배 가중치")
+
+            # 종합점수에 가중치 적용
+            if '종합점수' in gdf.columns:
+                # 종합점수를 float로 변환 (소수점 지원)
+                gdf['종합점수'] = gdf['종합점수'].astype(float)
+
+                # 10m 이내: 1.5배
+                if count_10m > 0:
+                    gdf.loc[gdf['전기화재'] == 2, '종합점수'] = \
+                        gdf.loc[gdf['전기화재'] == 2, '종합점수'] * 1.5
+
+                # 50m 이내: 1.2배
+                if count_50m > 0:
+                    gdf.loc[gdf['전기화재'] == 1, '종합점수'] = \
+                        gdf.loc[gdf['전기화재'] == 1, '종합점수'] * 1.2
+
+                print(f"  → 가중치 적용 완료")
+
+            print("=" * 70)
+
+        except Exception as e:
+            print(f"  전기화재이력 분석 오류: {e}")
+            print("  → 전기화재 가중치 미적용")
+            gdf['전기화재'] = 0
+
+        return gdf
 
     def save_results(self, gdf: gpd.GeoDataFrame, filename: str = None,
                      region_name: str = None, district_name: str = None,
@@ -1231,6 +1443,11 @@ class BuildingMultiRiskAnalyzer:
             filename = '_'.join(parts) + '.shp'
 
         output_path = self.output_path / filename
+
+        # =====================================================================
+        # 전기화재이력 가중치 적용
+        # =====================================================================
+        gdf = self._apply_fire_history_weight(gdf)
 
         # EPSG:5186 좌표계로 변환
         print(f"\n좌표계 변환 중 (EPSG:5186)...")
@@ -1275,6 +1492,8 @@ class BuildingMultiRiskAnalyzer:
             '노후홍수점수', '노후홍수등급', '노후홍수코드',
             '홍수산사태점수', '홍수산사태등급', '홍수산사태코드',
             '노후산사태점수', '노후산사태등급', '노후산사태코드',
+            # 전기화재이력
+            '전기화재',
             # 종합 위험도
             '종합점수', '종합등급', '위험코드'
         ]
@@ -1472,65 +1691,64 @@ def validate_region_input(analyzer, region_name: str) -> str:
 
 
 def validate_district_input(analyzer, region_name: str, district_input: str) -> list:
-    """구/군명 유효성 검사 및 오타 수정 (복수 입력 지원, 부분 매칭 지원)
-
-    개선된 기능:
-    - '청주시'처럼 부분 입력 시 해당 시의 모든 구를 찾아서 분석할지 물어봄
-    - 정확한 이름 매칭 우선, 부분 매칭은 확인 후 진행
-    """
+    """구/군명 유효성 검사 및 오타 수정 (수정 시 복수 입력 완벽 지원)"""
+    
     valid_districts = list(analyzer.region_mapping[region_name]['districts'].keys())
-
-    # 쉼표로 분리하여 복수 입력 처리
-    input_districts = [d.strip() for d in district_input.split(',') if d.strip()]
-
     validated = []
-    for district in input_districts:
-        current_district = district
+    
+    # 1. 처리해야 할 지역들을 큐(Queue)에 담습니다.
+    # 예: ['준주시', '전주시 덕진구']
+    queue = [d.strip() for d in district_input.split(',') if d.strip()]
 
-        # 1. 정확히 일치하는지 먼저 확인
+    # 2. 큐가 빌 때까지 하나씩 꺼내서 검사합니다.
+    while queue:
+        current_district = queue.pop(0) # 맨 앞의 지역을 꺼냄
+
+        # ---------------------------------------------------------
+        # Case A: 정확히 일치하는 경우 (정상)
+        # ---------------------------------------------------------
         if current_district in valid_districts:
             validated.append(current_district)
             continue
 
-        # 2. 부분 매칭 확인 (예: '청주시' → '청주시 상당구', '청주시 서원구' 등)
+        # ---------------------------------------------------------
+        # Case B: 부분 매칭 (예: '청주시' 입력 시)
+        # ---------------------------------------------------------
         partial_matches = [d for d in valid_districts if d.startswith(current_district)]
-
+        
         if partial_matches:
             print(f"\n📍 '{current_district}'으로 시작하는 구/군이 {len(partial_matches)}개 있습니다:")
             for i, name in enumerate(partial_matches, 1):
                 print(f"     {i}. {name}")
-
+            
+            is_handled = False
             while True:
                 choice = input(f"\n'{current_district}' 전체({len(partial_matches)}개 구/군)를 분석하시겠습니까? (y/n): ").strip().lower()
                 if choice == 'y':
                     validated.extend(partial_matches)
                     print(f"   ✓ '{current_district}' 전체 {len(partial_matches)}개 구/군 추가됨")
+                    is_handled = True
                     break
                 elif choice == 'n':
-                    # 개별 선택
                     print(f"\n   분석할 구/군을 직접 선택하세요 (쉼표로 구분, 건너뛰려면 Enter):")
                     sub_choice = input("   선택: ").strip()
                     if sub_choice:
-                        sub_districts = [d.strip() for d in sub_choice.split(',') if d.strip()]
-                        for sd in sub_districts:
-                            if sd in valid_districts:
-                                validated.append(sd)
-                            elif sd in partial_matches:
-                                validated.append(sd)
-                            else:
-                                # 번호로 선택했는지 확인
-                                try:
-                                    idx = int(sd) - 1
-                                    if 0 <= idx < len(partial_matches):
-                                        validated.append(partial_matches[idx])
-                                except ValueError:
-                                    print(f"     ⚠️ '{sd}' 인식 불가, 건너뜀")
+                        # 입력받은 지역들을 큐의 맨 앞에 추가하여 다시 검증받도록 함
+                        sub_items = [d.strip() for d in sub_choice.split(',') if d.strip()]
+                        for item in reversed(sub_items):
+                            queue.insert(0, item)
+                    is_handled = True
                     break
                 else:
                     print("   ⚠️ 'y' 또는 'n'만 입력해주세요.")
-            continue
+            
+            if is_handled:
+                continue
 
-        # 3. 부분 매칭도 없으면 기존 로직 (유사 이름 제안)
+        # ---------------------------------------------------------
+        # Case C: 오타 발생 및 수정 로직 (핵심 수정 부분)
+        # ---------------------------------------------------------
+        # 유효하지 않은 이름인 동안 계속 반복
         while current_district not in valid_districts:
             print(f"\n⚠️  '{current_district}'은(는) '{region_name}'에 존재하지 않는 구/군명입니다.")
 
@@ -1542,25 +1760,41 @@ def validate_district_input(analyzer, region_name: str, district_input: str) -> 
                     print(f"     {i}. {name}")
 
             print(f"\n   '{region_name}'의 구/군 목록:")
-            for i, name in enumerate(valid_districts, 1):
-                print(f"     {i}. {name}")
+            # 목록이 너무 길면 일부만 보여주기
+            if len(valid_districts) > 6:
+                print(f"     {', '.join(valid_districts[:6])} ... 외 {len(valid_districts)-6}개")
+            else:
+                for i, name in enumerate(valid_districts, 1):
+                    print(f"     {i}. {name}")
 
-            choice = input(f"\n'{district}' 대신 입력할 구/군명 (건너뛰려면 Enter): ").strip()
+            choice = input(f"\n'{current_district}' 대신 입력할 구/군명 (쉼표로 복수 입력 가능, 건너뛰려면 Enter): ").strip()
 
             if not choice:
-                print(f"   '{district}' 건너뜀")
+                print(f"   '{current_district}' 건너뜀")
                 current_district = None
                 break
+            
+            # [핵심] 쉼표(,)가 포함된 경우 분리해서 큐에 넣기
+            if ',' in choice:
+                new_items = [c.strip() for c in choice.split(',') if c.strip()]
+                print(f"   ✓ {len(new_items)}개 지역으로 분리하여 다시 확인합니다.")
+                
+                # 분리된 아이템들을 큐의 맨 앞에 추가 (Reversed로 넣어야 순서 유지됨)
+                for item in reversed(new_items):
+                    queue.insert(0, item)
+                
+                current_district = None # 현재 오타난 항목은 폐기
+                break # 내부 while 문 탈출 -> 바깥 queue loop가 새로 추가된 항목들을 처리함
             else:
+                # 쉼표가 없으면 단일 수정으로 간주하고 다시 검사 루프
                 current_district = choice
 
-        if current_district:
+        # 최종적으로 유효한 이름이 확정되면 결과 리스트에 추가
+        if current_district and current_district in valid_districts:
             validated.append(current_district)
 
-    # 중복 제거
-    validated = list(dict.fromkeys(validated))
-
-    return validated
+    # 중복 제거 및 반환
+    return list(dict.fromkeys(validated))
 
 
 def interactive_mode():
@@ -1588,6 +1822,27 @@ def interactive_mode():
         print("\n" + "=" * 50)
         print("등록된 사업소 목록")
         print("=" * 50)
+
+        # 본부 전체 조회 옵션 추출
+        headquarters = set()
+        for branch_name in analyzer.branch_mapping.keys():
+            if '본부' in branch_name:
+                # '서울본부직할' → '서울본부', '경기북부본부직할' → '경기북부본부'
+                hq_idx = branch_name.find('본부') + 2
+                hq_name = branch_name[:hq_idx]
+                headquarters.add(hq_name)
+
+        # 본부 전체 조회 옵션 표시
+        if headquarters:
+            print("\n[본부 전체 조회] (본부명만 입력하면 직할+모든지사 전체 분석)")
+            sorted_hqs = sorted(headquarters)
+            # 한 줄에 5개씩 표시
+            for i in range(0, len(sorted_hqs), 5):
+                chunk = sorted_hqs[i:i+5]
+                print(f"  {', '.join(chunk)}")
+
+        # 개별 사업소 목록 표시
+        print("\n[개별 사업소]")
         for branch_name, districts in analyzer.branch_mapping.items():
             if isinstance(districts, list):
                 districts_str = ', '.join(districts[:5])
@@ -1604,7 +1859,8 @@ def interactive_mode():
     print("[1단계] 광역지자체 또는 사업소 선택")
     print("-" * 70)
     print("  - 광역지자체: 쉼표(,)로 복수 선택 가능 (예: 서울, 부산)")
-    print("  - 사업소명: 직접 입력 (예: 서울본부직할, 충북본부)")
+    print("  - 본부 전체: 본부명만 입력 (예: 서울본부 → 직할+모든지사 전체)")
+    print("  - 개별 사업소: 직접 입력 (예: 서울본부직할, 서울동부지사)")
     print("  - 단일 선택 후 구/군 지정 가능")
 
     region_input = input("\n분석할 광역지자체 또는 사업소를 입력하세요: ").strip()
